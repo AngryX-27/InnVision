@@ -1,0 +1,399 @@
+# version: "3.9"
+
+networks:
+  innvision_net:
+    driver: bridge
+
+volumes:
+  aggregator_db_data:
+  translation_db_data:
+
+services:
+  ##########################################################################
+  # 1) БАЗА ДАННЫХ POSTGRES (aggregator_db)
+  ##########################################################################
+  aggregator_db:
+    image: postgres:15
+    container_name: aggregator_db
+    environment:
+      # NEW: Эти поля можно взять из .env
+      POSTGRES_USER: ${AGGREGATOR_DB_USER:-aggregator_user}
+      POSTGRES_PASSWORD: ${AGGREGATOR_DB_PASS:-aggregator_pass}
+      POSTGRES_DB: ${AGGREGATOR_DB_NAME:-aggregator_db}
+    ports:
+      # NEW: Меняем левую часть на 5434 (или берём из .env => AGGREGATOR_DB_PORT=5434)
+      #- "${AGGREGATOR_DB_PORT:-5434}:5432"
+      - "5434:5432"
+    volumes:
+      - aggregator_db_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    stop_grace_period: 30s
+    networks:
+      - innvision_net
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "pg_isready",
+          "-U",
+          "${AGGREGATOR_DB_USER:-aggregator_user}",
+          "-d",
+          "${AGGREGATOR_DB_NAME:-aggregator_db}",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    # NEW: Logging and deploy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      # NEW: Если вы используете Docker Swarm / ECS, можете включить лимиты
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "512M"
+
+  ##########################################################################
+  # 2) ROLE_GENERAL SERVICE
+  ##########################################################################
+  role_general:
+    build:
+      context: ./role_general_service
+      dockerfile: Dockerfile
+    container_name: role_general_service
+    # NEW: Подхватываем порт из .env (ROLE_GENERAL_PORT) или 5001
+    ports:
+      - "${ROLE_GENERAL_PORT:-5001}:5001"
+    # NEW: Можно общие переменные держать в .env, + локальный .env
+    env_file:
+      - ./.env
+      - ./role_general_service/.env
+    environment:
+      PORT: "${ROLE_GENERAL_PORT:-5001}"
+    depends_on:
+      aggregator_db:
+        condition: service_healthy
+    networks:
+      - innvision_net
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "http://localhost:${ROLE_GENERAL_PORT:-5001}/health",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 36
+      start_period: 180s
+    # NEW: Logging and deploy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "512M"
+
+  ##########################################################################
+  # 3) ORCHESTRATOR SERVICE
+  ##########################################################################
+  orchestrator:
+    build:
+      context: ./orchestrator_service
+      dockerfile: Dockerfile
+    container_name: orchestrator_service
+    ports:
+      # NEW: Orchestrator порт из .env (ORCHESTRATOR_PORT) или 5000
+      - "${ORCHESTRATOR_PORT:-5000}:5000"
+    env_file:
+      - ./.env
+      - ./orchestrator_service/.env
+    environment:
+      PORT: "${ORCHESTRATOR_PORT:-5000}"
+      TRANSLATION_SERVICE_URL: "${TRANSLATION_SERVICE_URL:-http://translation_service:5005}"
+    depends_on:
+      role_general:
+        condition: service_healthy
+      translation_service:
+        condition: service_healthy
+    networks:
+      - innvision_net
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "http://localhost:${ORCHESTRATOR_PORT:-5000}/api/health",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    # NEW: Logging and deploy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "512M"
+
+  ##########################################################################
+  # 4) AGGREGATOR SERVICE
+  ##########################################################################
+  aggregator:
+    build:
+      context: .
+      dockerfile: aggregator_service/Dockerfile
+    container_name: aggregator_service
+    # NEW: порты из .env (AGGREGATOR_PORT) или 5002
+    ports:
+      - "${AGGREGATOR_PORT:-5002}:5002"
+    env_file:
+      - ./.env
+      - ./aggregator_service/.env
+    environment:
+      PORT: "${AGGREGATOR_PORT:-5002}"
+      # NEW: DB_URL можно собрать из .env (AGGREGATOR_DB_URL)
+      DB_URL: "${AGGREGATOR_DB_URL:-postgresql://aggregator_user:aggregator_pass@aggregator_db:5432/aggregator_db}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+      aggregator_db:
+        condition: service_healthy
+    networks:
+      - innvision_net
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      # NEW: используем AGGREGATOR_PORT
+      test:
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "http://localhost:${AGGREGATOR_PORT:-5002}/api/health",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    # NEW: Logging and deploy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "512M"
+
+  ##########################################################################
+  # 5) QA_SERVICE
+  ##########################################################################
+  qa_service:
+    build:
+      context: ./qa_service
+      dockerfile: Dockerfile
+    container_name: qa_service
+    # NEW: QA_SERVICE_PORT (или 5003)
+    ports:
+      - "${QA_SERVICE_PORT:-5003}:5003"
+    env_file:
+      - ./.env
+      - ./qa_service/.env
+    environment:
+      PORT: "${QA_SERVICE_PORT:-5003}"
+      # NEW: добавляем лог-переменные, чтобы не было Pydantic ValidationError
+      LOG_CONSOLE_LEVEL: "INFO"
+      LOG_FILE_LEVEL: "INFO"
+    networks:
+      - innvision_net
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "http://localhost:${QA_SERVICE_PORT:-5003}/api/health",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 36
+      start_period: 180s
+    # NEW: Logging and deploy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "512M"
+
+  ##########################################################################
+  # 6) FALLBACK WORKER (AGGREGATOR_FALLBACK)
+  ##########################################################################
+  aggregator_fallback:
+    build:
+      context: ./aggregator_service
+      dockerfile: Dockerfile
+    container_name: aggregator_fallback
+    command: ["python", "-m", "aggregator_service.logic.fallback_loop"]
+    env_file:
+      - ./.env
+      - ./aggregator_service/.env
+    environment:
+      # NEW: fallback-сервис порт (если хотим HealthCheck)
+      PORT: "${AGGREGATOR_FALLBACK_PORT:-5004}"
+      DB_URL: "${AGGREGATOR_DB_URL:-postgresql://aggregator_user:aggregator_pass@aggregator_db:5432/aggregator_db}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ORCHESTRATOR_URL: "${ORCHESTRATOR_URL:-http://orchestrator:5000}"
+    # NEW: Можно экспортировать порт, чтобы healthcheck работал
+    # Если хотите, можно открыть его наружу
+    ports:
+      - "${AGGREGATOR_FALLBACK_PORT:-5004}:5004"
+    depends_on:
+      aggregator_db:
+        condition: service_healthy
+      orchestrator:
+        condition: service_healthy
+    networks:
+      - innvision_net
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "http://localhost:${AGGREGATOR_FALLBACK_PORT:-5004}/api/health",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    # NEW: Logging and deploy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.3"
+          memory: "256M"
+
+  ##########################################################################
+  # 7) БАЗА ДАННЫХ POSTGRES (translation_db)
+  ##########################################################################
+  translation_db:
+    image: postgres:15
+    container_name: translation_db
+    environment:
+      # NEW
+      POSTGRES_USER: ${TRANSLATION_DB_USER:-translation_user}
+      POSTGRES_PASSWORD: ${TRANSLATION_DB_PASS:-translation_pass}
+      POSTGRES_DB: ${TRANSLATION_DB_NAME:-translation_db}
+    ports:
+      #- "${TRANSLATION_DB_PORT:-5433}:5432"
+      - "5433:5432"
+    volumes:
+      - translation_db_data:/var/lib/postgresql/data
+    networks:
+      - innvision_net
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "pg_isready",
+          "-U",
+          "${TRANSLATION_DB_USER:-translation_user}",
+          "-d",
+          "${TRANSLATION_DB_NAME:-translation_db}",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    # NEW: Logging and deploy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "512M"
+
+  ##########################################################################
+  # 8) TRANSLATION SERVICE
+  ##########################################################################
+  translation_service:
+    build:
+      context: .
+      dockerfile: translation_service/Dockerfile
+    container_name: translation_service
+    # NEW
+    ports:
+      - "${TRANSLATION_SERVICE_PORT:-5005}:5005"
+    env_file:
+      - ./.env
+      - ./translation_service/.env
+    environment:
+      PORT: "${TRANSLATION_SERVICE_PORT:-5005}"
+      DB_URL: "${TRANSLATION_DB_URL:-postgresql://translation_user:translation_pass@translation_db:5432/translation_db}"
+      ENV: "${TRANSLATION_SERVICE_ENV:-development}"
+    depends_on:
+      translation_db:
+        condition: service_healthy
+    networks:
+      - innvision_net
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -f http://localhost:${TRANSLATION_SERVICE_PORT:-5005}/api/health || exit 1",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 36
+      start_period: 180s
+    # NEW: Logging and deploy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "512M"

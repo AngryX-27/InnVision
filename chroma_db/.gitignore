@@ -1,0 +1,7 @@
+# Игнорировать любые файлы и папки, созданные Chroma
+*
+.env
+
+# Исключить сам .gitignore и .gitkeep
+!.gitignore
+!.gitkeep
